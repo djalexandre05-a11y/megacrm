@@ -136,14 +136,9 @@ async function handlePost(req: ApiRequest, res: ApiResponse) {
         .status(400)
         .json({ success: false, message: 'Conta selecionada nao encontrada.' });
     }
-  } else if (accounts.length === 1) {
-    account = accounts[0];
   } else {
-    return res.status(200).json({
-      success: false,
-      needsSelection: true,
-      accounts: accounts.map((item) => ({ id: item.id, name: item.name })),
-    });
+    // Automático: escolhe a primeira conta da lista (comportamento similar ao huggy-bot-main)
+    account = accounts[0];
   }
 
   const profileId = await resolveProfileId(apiKey, account);

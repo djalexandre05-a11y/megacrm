@@ -152,11 +152,7 @@ export default function CredentialsPage() {
           body: JSON.stringify({}),
         });
         const connectBody = await connectRes.json();
-        if (connectRes.ok && connectBody.needsSelection) {
-          toast.warning('Varias contas WhatsApp encontradas.', {
-            description: 'Reexecute o /setup para escolher a conta a operar.',
-          });
-        } else if (!connectRes.ok || !connectBody.success) {
+        if (!connectRes.ok || !connectBody.success) {
           toast.warning('Chave salva, mas a reconexao com o Zernio falhou.', {
             description: connectBody.message ?? 'Tente novamente.',
           });

@@ -368,10 +368,10 @@ export async function getNumberInfo(apiKey: string, accountId: string): Promise<
   };
 }
 
-// POST /media/upload-direct — sobe o binário (máx 25MB, auto-delete em 7 dias)
-// e devolve a `url` para usar no attachmentUrl do send message. NÃO usa zfetch
-// porque o corpo é binário (Content-Type = mime do arquivo), não JSON.
-// ASSUMIDO: binário cru no body + filename via query. Confirmar na doc real.
+// POST /media/upload-direct — sobe o arquivo via multipart/form-data (máx 25MB,
+// auto-delete em 7 dias) e devolve a `url` para usar no attachmentUrl do send
+// message. NÃO usa zfetch porque o corpo é FormData, não JSON.
+// Formato confirmado no huggy-bot: FormData com campos "file" e "contentType".
 export async function uploadMediaDirect(input: {
   apiKey: string;
   bytes: Uint8Array;
@@ -384,15 +384,19 @@ export async function uploadMediaDirect(input: {
   }
   let res: Response;
   try {
+    const form = new FormData();
+    form.append('file', new Blob([input.bytes], { type: input.contentType }), input.filename);
+    form.append('contentType', input.contentType);
     res = await fetch(
-      `${ZERNIO_API_BASE_URL}/media/upload-direct?filename=${encodeURIComponent(input.filename)}`,
+      `${ZERNIO_API_BASE_URL}/media/upload-direct`,
       {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${input.apiKey}`,
-          'Content-Type': input.contentType,
+          // NÃO setar Content-Type manualmente — o browser/runtime define
+          // o boundary do multipart automaticamente.
         },
-        body: input.bytes,
+        body: form,
       },
     );
   } catch (err) {
@@ -416,11 +420,8 @@ export async function uploadMediaDirect(input: {
         : null;
     throw new ZernioError(msg ?? `Zernio upload-direct respondeu ${res.status}`);
   }
-  const data =
-    body && typeof body === 'object' && 'data' in (body as Record<string, unknown>)
-      ? (body as Record<string, unknown>).data
-      : body;
-  const url = pickString((data ?? {}) as Record<string, unknown>, ['url', 'link', 'href']);
+  // A resposta do Zernio devolve { url, filename, contentType, size }.
+  const url = pickString((body ?? {}) as Record<string, unknown>, ['url', 'link', 'href']);
   if (!url) throw new ZernioError('Zernio upload-direct não retornou url.');
   return url;
 }

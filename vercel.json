@@ -10,7 +10,7 @@
     }
   },
   "rewrites": [
-    { "source": "/:path((?!assets/).*)", "destination": "/index.html" }
+    { "source": "/:path((?!api/|assets/).*)", "destination": "/index.html" }
   ],
   "headers": [
     {

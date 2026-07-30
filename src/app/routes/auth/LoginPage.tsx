@@ -57,17 +57,6 @@ export default function LoginPage() {
     <AuthShell
       title="Entrar"
       subtitle="Acesse seu painel MEGACRM."
-      footer={
-        <>
-          Ainda não tem conta?{' '}
-          <Link
-            to="/auth/signup"
-            className="text-[var(--accent-primary)] hover:underline font-medium"
-          >
-            Criar conta
-          </Link>
-        </>
-      }
     >
       <form onSubmit={handleSubmit} className="space-y-5">
         <div className="space-y-2">

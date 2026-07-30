@@ -1,0 +1,896 @@
+import type React from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Check, Eye, EyeOff, ExternalLink, Loader2, X } from 'lucide-react';
+import { toast } from 'sonner';
+import { createClient } from '@supabase/supabase-js';
+import { CredentialField } from '@/components/credentials/CredentialField';
+import { WhatsAppProviderCards } from '@/components/setup/WhatsAppProviderCards';
+import { setupConfig } from '../../../../setup.config';
+import {
+  hasAtLeastOneWhatsAppProvider,
+  hasUazapiProvider,
+  NO_WHATSAPP_PROVIDER_MESSAGE,
+} from './whatsappProviders';
+import { getSupabaseCredentials } from '@/lib/supabase';
+
+type Step = 1 | 2 | 3 | 4;
+type FieldKey =
+  | 'supabase_url'
+  | 'supabase_anon_key'
+  | 'supabase_service_role_key'
+  | 'supabase_pat'
+  | 'vercel_token'
+  | 'owner_email'
+  | 'owner_password';
+
+type CoreValues = Record<FieldKey, string>;
+type ValidationMap = Partial<Record<FieldKey, { ok: boolean; message: string }>>;
+
+const STORAGE_KEY = 'agentise.setup.step2';
+const STEP_LABELS = ['PREPARAR', 'CREDENCIAIS', 'BOOTSTRAP', 'APIS'] as const;
+
+// Each Step 3 row maps to the checkpoint that api/bootstrap.ts writes into
+// public._bootstrap_state. The wizard hydrates the timeline from those rows so
+// a refresh mid-bootstrap shows the real progress instead of restarting blind.
+// The final row ('app_live') is NOT a _bootstrap_state checkpoint — it is only
+// completed once the health probe confirms the redeploy is live with envs.
+const TIMELINE_STEPS: { label: string; key: string }[] = [
+  { label: 'Conectando ao Supabase', key: 'connection_ok' },
+  { label: 'Rodando migrations', key: 'migrations_done' },
+  { label: 'Deployando Edge Functions', key: 'edge_functions_deployed' },
+  { label: 'Criando conta de administrador', key: 'owner_created' },
+  { label: 'Configurando Vercel', key: 'vercel_envs_set' },
+  { label: 'Disparando redeploy', key: 'redeploy_triggered' },
+  { label: 'Aguardando aplicacao reiniciar', key: 'app_live' },
+];
+
+const HEALTH_POLL_INTERVAL_MS = 4000;
+const HEALTH_POLL_TIMEOUT_MS = 5 * 60 * 1000;
+
+const emptyCore: CoreValues = {
+  supabase_url: '',
+  supabase_anon_key: '',
+  supabase_service_role_key: '',
+  supabase_pat: '',
+  vercel_token: '',
+  owner_email: '',
+  owner_password: '',
+};
+
+function PrimaryButton(props: React.ButtonHTMLAttributes<HTMLButtonElement>) {
+  return (
+    <button
+      {...props}
+      className={[
+        'min-h-12 rounded-xl px-8 py-4 text-base font-medium text-white transition-[box-shadow,opacity,transform] duration-[400ms] ease-[cubic-bezier(0.4,0,0.2,1)]',
+        'bg-[linear-gradient(135deg,#1E3A8A_0%,#3B82F6_100%)] shadow-[0_8px_40px_rgba(59,130,246,0.4),0_0_60px_rgba(59,130,246,0.2)]',
+        'hover:shadow-[0_8px_50px_rgba(59,130,246,0.6),0_0_80px_rgba(59,130,246,0.3)] disabled:cursor-not-allowed disabled:opacity-40 disabled:shadow-none',
+        'w-full sm:w-auto',
+        props.className ?? '',
+      ].join(' ')}
+    />
+  );
+}
+
+function StepIndicator({ step }: { step: Step }) {
+  return (
+    <div className="mb-10 flex w-full items-start justify-center">
+      {STEP_LABELS.map((label, index) => {
+        const n = index + 1;
+        const active = step === n;
+        const complete = step > n;
+        return (
+          <div key={label} className="flex min-w-0 flex-1 items-start last:flex-none sm:flex-none">
+            <div className="flex flex-col items-center">
+              <div
+                className={[
+                  'flex h-10 w-10 items-center justify-center rounded-full text-sm font-semibold',
+                  active
+                    ? 'bg-[#3B82F6] text-white shadow-[0_0_30px_rgba(59,130,246,0.5)]'
+                    : complete
+                      ? 'bg-[#1E3A8A] text-white'
+                      : 'border border-[rgba(59,130,246,0.3)] bg-transparent text-[#94A3B8]',
+                ].join(' ')}
+              >
+                {complete ? <Check className="h-4 w-4" /> : n}
+              </div>
+              <div
+                className={[
+                  'mt-3 whitespace-nowrap text-[11px] font-medium uppercase tracking-[0.1em]',
+                  active ? 'text-[#F8FAFC]' : 'text-[#94A3B8]',
+                ].join(' ')}
+              >
+                {label}
+              </div>
+            </div>
+            {index < STEP_LABELS.length - 1 ? (
+              <div className="mx-2 mt-5 h-px w-8 border-t border-[rgba(59,130,246,0.2)] sm:mx-5 sm:w-20" />
+            ) : null}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function SetupCard({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="rounded-2xl border border-[rgba(59,130,246,0.15)] bg-white/[0.02] p-6 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)] backdrop-blur-[40px] md:p-12">
+      {children}
+    </div>
+  );
+}
+
+function PrepItem({
+  n,
+  title,
+  text,
+  href,
+  pills,
+}: {
+  n: number;
+  title: string;
+  text: string;
+  href: string;
+  pills: string[];
+}) {
+  return (
+    <div className="relative rounded-xl border border-[rgba(59,130,246,0.12)] bg-white/[0.02] p-5">
+      <div className="flex gap-4 pr-16">
+        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-[rgba(59,130,246,0.4)] text-sm font-medium text-[#60A5FA]">
+          {n}
+        </div>
+        <div>
+          <h2 className="text-base font-semibold text-[#F8FAFC]">{title}</h2>
+          <p className="mt-1 text-[13px] leading-5 text-[#94A3B8]">{text}</p>
+          <div className="mt-4 flex flex-wrap gap-2">
+            {pills.map((pill) => (
+              <span
+                key={pill}
+                className="rounded-full border border-[rgba(59,130,246,0.3)] bg-[rgba(30,58,138,0.4)] px-3 py-1 font-mono text-[11px] uppercase tracking-[0.05em] text-[#60A5FA]"
+              >
+                {pill}
+              </span>
+            ))}
+          </div>
+        </div>
+      </div>
+      <a
+        href={href}
+        target="_blank"
+        rel="noreferrer"
+        className="absolute right-5 top-5 inline-flex items-center gap-1 text-sm text-[#60A5FA] hover:text-[#85B7EB]"
+      >
+        abrir
+        <ExternalLink className="h-3.5 w-3.5" />
+      </a>
+    </div>
+  );
+}
+
+// Network-backed field checks (Supabase keys/PAT, Vercel token) run through
+// the server proxy so the tokens never go from the browser to api.supabase.com
+// / api.vercel.com directly. Pure-regex fields stay client-side.
+async function validateCoreField(
+  key: FieldKey,
+  value: string,
+  context: Record<string, string>,
+): Promise<{ ok: boolean; message: string }> {
+  try {
+    const res = await fetch('/api/validate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind: 'core', key, value, context }),
+    });
+    const body = (await res.json()) as { ok: boolean; message?: string };
+    return { ok: body.ok, message: body.message ?? '' };
+  } catch {
+    return { ok: false, message: 'Falha ao validar.' };
+  }
+}
+
+export default function SetupPage() {
+  const [step, setStep] = useState<Step>(() => {
+    const value = new URLSearchParams(window.location.search).get('step');
+    if (value === '4') return 4;
+    if (value === '3') return 3;
+    return 1;
+  });
+  const [core, setCore] = useState<CoreValues>(() => {
+    const saved = window.localStorage.getItem(STORAGE_KEY);
+    if (!saved) return emptyCore;
+    return { ...emptyCore, ...JSON.parse(saved), owner_password: '' };
+  });
+  const [validation, setValidation] = useState<ValidationMap>({});
+  // A core field is validated only after the user interacts with it, so a
+  // pristine Step 2 never shows red errors before any input. Fields restored
+  // from localStorage already carry a value, so we treat them as touched to
+  // keep the returning-user flow (auto-validate + enable Configurar) intact.
+  const [touched, setTouched] = useState<Partial<Record<FieldKey, boolean>>>(() =>
+    Object.fromEntries(
+      (Object.keys(core) as FieldKey[])
+        .filter((key) => core[key].trim() !== '')
+        .map((key) => [key, true]),
+    ),
+  );
+  const [bootstrapping, setBootstrapping] = useState(false);
+  const [timeline, setTimeline] = useState<string[]>([]);
+  const [appCredentials, setAppCredentials] = useState<Record<string, string>>({});
+  const [appValidation, setAppValidation] = useState<Record<string, boolean>>({});
+  const [savingApps, setSavingApps] = useState(false);
+  const [registeringHook, setRegisteringHook] = useState(false);
+  // Zernio pode ter mais de uma conta WhatsApp sob a mesma API Key; quando
+  // zernio-connect responde needsSelection, o wizard mostra o seletor abaixo.
+  const [accountChoices, setAccountChoices] = useState<{ id: string; name: string }[] | null>(null);
+  const [selectedAccount, setSelectedAccount] = useState<string>('');
+  const [showCorePassword, setShowCorePassword] = useState<Record<FieldKey, boolean>>(
+    {} as Record<FieldKey, boolean>,
+  );
+  const [ownerToken, setOwnerToken] = useState<string | null>(null);
+  const [loginEmail, setLoginEmail] = useState(() => core.owner_email);
+  const [loginPassword, setLoginPassword] = useState('');
+  const [showLoginPassword, setShowLoginPassword] = useState(false);
+  const [loggingIn, setLoggingIn] = useState(false);
+  const [waitingForApp, setWaitingForApp] = useState(false);
+  const [deployTimedOut, setDeployTimedOut] = useState(false);
+  const pollingRef = useRef(false);
+
+  useEffect(() => {
+    const safe = { ...core, owner_password: '' };
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(safe));
+  }, [core]);
+
+  useEffect(() => {
+    if (step !== 2) return;
+    const timers = Object.entries(core).map(([key, value]) =>
+      window.setTimeout(async () => {
+        const field = key as FieldKey;
+        if (!touched[field]) return;
+        const v = value.trim();
+        let result = { ok: true, message: '' };
+        if (field === 'supabase_url') {
+          result = /^https:\/\/[a-z0-9-]+\.supabase\.(co|in)$/i.test(v)
+            ? { ok: true, message: 'URL valida.' }
+            : { ok: false, message: 'Use https://xxxxx.supabase.co' };
+        } else if (field === 'supabase_anon_key' || field === 'supabase_service_role_key') {
+          result = v && core.supabase_url
+            ? await validateCoreField(field, v, { supabase_url: core.supabase_url })
+            : { ok: false, message: 'Preencha URL e chave.' };
+        } else if (field === 'supabase_pat') {
+          result = v
+            ? await validateCoreField(field, v, {})
+            : { ok: false, message: 'Informe o PAT.' };
+        } else if (field === 'vercel_token') {
+          result = v
+            ? await validateCoreField(field, v, {})
+            : { ok: false, message: 'Informe o token Vercel.' };
+        } else if (field === 'owner_email') {
+          result = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)
+            ? { ok: true, message: 'Email valido.' }
+            : { ok: false, message: 'Email invalido.' };
+        } else if (field === 'owner_password') {
+          result = /^(?=.*[A-Za-z])(?=.*\d).{8,}$/.test(v)
+            ? { ok: true, message: 'Senha valida.' }
+            : { ok: false, message: 'Minimo 8 caracteres, com letra e numero.' };
+        }
+        setValidation((prev) => ({ ...prev, [field]: result }));
+      }, 800),
+    );
+    return () => timers.forEach(window.clearTimeout);
+  }, [core, step, touched]);
+
+  const coreReady = useMemo(
+    () =>
+      ([
+        'supabase_url',
+        'supabase_anon_key',
+        'supabase_service_role_key',
+        'supabase_pat',
+        'vercel_token',
+        'owner_email',
+        'owner_password',
+      ] as FieldKey[]).every((key) => validation[key]?.ok),
+    [validation],
+  );
+
+  // The redeploy that api/bootstrap fires only activates the core envs in a NEW
+  // deployment. We poll the app's own /api/health (same-origin, no VERCEL_TOKEN)
+  // until it reports 200 — meaning process.env.SUPABASE_URL is live — before
+  // advancing to Step 4, whose API Routes need those envs. Without this gate
+  // Step 4 races the redeploy and /api/credentials returns 500.
+  const waitForAppLive = useCallback(async () => {
+    if (pollingRef.current) return;
+    pollingRef.current = true;
+    setWaitingForApp(true);
+    setDeployTimedOut(false);
+    setTimeline(TIMELINE_STEPS.slice(0, 6).map((entry) => entry.label));
+    const deadline = Date.now() + HEALTH_POLL_TIMEOUT_MS;
+    try {
+      while (Date.now() < deadline) {
+        try {
+          const res = await fetch(`${window.location.origin}/api/health`, { cache: 'no-store' });
+          if (res.ok) {
+            setTimeline(TIMELINE_STEPS.map((entry) => entry.label));
+            window.location.href = '/setup?step=4&r=' + Date.now();
+            return;
+          }
+        } catch {
+          // Network blips are expected while the production alias swaps over.
+        }
+        await new Promise((resolve) => setTimeout(resolve, HEALTH_POLL_INTERVAL_MS));
+      }
+      setDeployTimedOut(true);
+    } finally {
+      setWaitingForApp(false);
+      pollingRef.current = false;
+    }
+  }, []);
+
+  // On (re)entering Step 3 while not actively bootstrapping — e.g. after a
+  // refresh — read public._bootstrap_state and reflect completed checkpoints in
+  // the timeline so the user sees where the run stopped. If the redeploy was
+  // already triggered, resume polling for the app to come live.
+  useEffect(() => {
+    if (step !== 3 || bootstrapping) return;
+    if (!core.supabase_url || !core.supabase_pat) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch('/api/bootstrap-status', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ supabase_url: core.supabase_url, supabase_pat: core.supabase_pat }),
+        });
+        const body = (await res.json()) as { completed?: string[] };
+        if (cancelled || !Array.isArray(body.completed)) return;
+        const done = new Set(body.completed);
+        setTimeline(
+          TIMELINE_STEPS.filter((entry) => done.has(entry.key)).map((entry) => entry.label),
+        );
+        if (done.has('redeploy_triggered')) void waitForAppLive();
+      } catch {
+        // Leave the timeline empty; the user can still retry.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [step, bootstrapping, core.supabase_url, core.supabase_pat, waitForAppLive]);
+
+  const runBootstrap = async () => {
+    setStep(3);
+    // Keep ?step=3 in the URL so a refresh mid-bootstrap returns here (and
+    // re-hydrates from _bootstrap_state) instead of bouncing back to Step 1.
+    window.history.replaceState(null, '', '/setup?step=3');
+    setBootstrapping(true);
+    setDeployTimedOut(false);
+    setTimeline(['Conectando ao Supabase']);
+    try {
+      const res = await fetch('/api/bootstrap', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(core),
+      });
+      const body = await res.json();
+      if (!res.ok || !body.success) throw new Error(body.message ?? 'Bootstrap falhou.');
+      toast.success('Bootstrap concluido. Aguardando o app reiniciar...');
+      // Don't jump to Step 4 yet — wait for the redeploy to bring the envs live.
+      await waitForAppLive();
+    } catch (err) {
+      toast.error('Bootstrap falhou', {
+        description: err instanceof Error ? err.message : 'Erro interno',
+      });
+    } finally {
+      setBootstrapping(false);
+    }
+  };
+
+  // Step 4 runs after a full-page redirect, so the owner password is already
+  // gone from memory/localStorage. We re-ask for it to mint a session token —
+  // /api/credentials now requires an admin JWT. persistSession:false keeps this
+  // throwaway client from clobbering the main app's auth storage.
+  const loginOwner = async () => {
+    setLoggingIn(true);
+    try {
+      const client = createClient(core.supabase_url, core.supabase_anon_key, {
+        auth: { persistSession: false },
+      });
+      const { data, error } = await client.auth.signInWithPassword({
+        email: loginEmail.trim(),
+        password: loginPassword,
+      });
+      if (error || !data.session) throw new Error(error?.message ?? 'Login falhou.');
+      setOwnerToken(data.session.access_token);
+      setLoginPassword('');
+      toast.success('Owner autenticado.');
+    } catch (err) {
+      toast.error('Falha no login do owner', {
+        description: err instanceof Error ? err.message : 'Credenciais invalidas',
+      });
+    } finally {
+      setLoggingIn(false);
+    }
+  };
+
+  // Salva as chaves no cofre e, em seguida, pede ao servidor que resolva a conta
+  // WhatsApp do Zernio (accountId/profileId/tier) e registre o webhook. A Zernio
+  // API Key nunca chama o Zernio direto do browser — quem fala com o Zernio e a
+  // API Route. `accountId` so e passado no segundo clique, quando ha varias
+  // contas e o operador escolheu uma no seletor.
+  const saveAppCredentials = async (accountId?: string) => {
+    setSavingApps(true);
+    try {
+      const creds: Record<string, string> = { ...appCredentials };
+      if (!(creds.llm_provider ?? '').trim()) creds.llm_provider = 'openai';
+
+      const saveRes = await fetch('/api/credentials', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${ownerToken ?? ''}`,
+        },
+        body: JSON.stringify({ credentials: creds }),
+      });
+      const saveBody = await saveRes.json();
+      if (!saveRes.ok || !saveBody.success) throw new Error(saveBody.message ?? 'Falha ao salvar.');
+
+      // Uazapi-only: sem Zernio não há conta oficial/webhook para resolver.
+      // A conexão do provedor não-oficial é tratada nas fases de inbound.
+      const hasZernio = !!(creds.zernio_api_key ?? '').trim();
+      if (!hasZernio) {
+        window.localStorage.removeItem(STORAGE_KEY);
+        toast.success('Credenciais salvas (Uazapi).');
+        window.location.href = setupConfig.postBootstrapRedirect;
+        return;
+      }
+
+      const connectRes = await fetch('/api/zernio-connect', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${ownerToken ?? ''}`,
+        },
+        body: JSON.stringify(accountId ? { accountId } : {}),
+      });
+      const connectBody = await connectRes.json();
+
+      if (connectRes.ok && connectBody.needsSelection) {
+        setAccountChoices(connectBody.accounts ?? []);
+        toast.message('Selecione a conta WhatsApp do Zernio para conectar.');
+        return;
+      }
+      if (!connectRes.ok || !connectBody.success) {
+        throw new Error(connectBody.message ?? 'Falha ao conectar o WhatsApp via Zernio.');
+      }
+      if (connectBody.webhookWarning) {
+        toast.warning('WhatsApp conectado, mas o webhook nao foi registrado automaticamente.', {
+          description: connectBody.webhookWarning,
+        });
+      }
+
+      window.localStorage.removeItem(STORAGE_KEY);
+      const phone = connectBody.number?.display_phone_number as string | undefined;
+      toast.success(phone ? `WhatsApp ${phone} conectado.` : 'Credenciais salvas.');
+      window.location.href = setupConfig.postBootstrapRedirect;
+    } catch (err) {
+      toast.error('Falha ao salvar credenciais', {
+        description: err instanceof Error ? err.message : 'Erro interno',
+      });
+    } finally {
+      setSavingApps(false);
+    }
+  };
+
+  // Cadastro automático do webhook na Uazapi, direto do wizard (mesma ação de
+  // Configurações → Credenciais). Como o /api/uazapi-status lê as credenciais
+  // do app_settings via getCredential, primeiro persistimos a URL + token da
+  // instância; só então a Uazapi consegue registrar o webhook.
+  const registerUazapiWebhook = async () => {
+    setRegisteringHook(true);
+    try {
+      const uazapiCreds: Record<string, string> = {};
+      const serverUrl = (appCredentials.uazapi_server_url ?? '').trim();
+      const instanceToken = (appCredentials.uazapi_instance_token ?? '').trim();
+      if (serverUrl) uazapiCreds.uazapi_server_url = serverUrl;
+      if (instanceToken) uazapiCreds.uazapi_instance_token = instanceToken;
+
+      const saveRes = await fetch('/api/credentials', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${ownerToken ?? ''}`,
+        },
+        body: JSON.stringify({ credentials: uazapiCreds }),
+      });
+      const saveBody = await saveRes.json();
+      if (!saveRes.ok || !saveBody.success) {
+        throw new Error(saveBody.message ?? 'Falha ao salvar as credenciais da Uazapi.');
+      }
+
+      const hookRes = await fetch('/api/uazapi-status', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${ownerToken ?? ''}` },
+      });
+      const hookBody = await hookRes.json();
+      if (!hookRes.ok || !hookBody.success) {
+        throw new Error(hookBody.message ?? 'A Uazapi recusou o registro do webhook.');
+      }
+      toast.success('Webhook registrado na Uazapi.');
+    } catch (err) {
+      toast.error('Não foi possível registrar o webhook automaticamente', {
+        description: err instanceof Error ? err.message : 'Erro interno',
+      });
+    } finally {
+      setRegisteringHook(false);
+    }
+  };
+
+  const onCredentialChange = useCallback((key: string, value: string | null) => {
+    setAppCredentials((prev) => {
+      const next = { ...prev };
+      if (value === null) delete next[key];
+      else next[key] = value;
+      return next;
+    });
+  }, []);
+
+  // O step 4 coleta: um provedor de WhatsApp (Zernio OU Uazapi — pelo menos um)
+  // + OpenAI (embeddings/Whisper). Provider/chave de LLM e App URL ficam em
+  // /settings/credentials (o LLM cai no padrão openai usando a OpenAI API Key).
+  const fieldByKey = (key: string) =>
+    setupConfig.appCredentials.find((f) => f.key === key)!;
+  const zernioField = fieldByKey('zernio_api_key');
+  const uazapiUrlField = fieldByKey('uazapi_server_url');
+  const uazapiTokenField = fieldByKey('uazapi_instance_token');
+  const openaiField = fieldByKey('openai_api_key');
+
+  const whatsappOk = hasAtLeastOneWhatsAppProvider(appCredentials, appValidation);
+  const uazapiOk = hasUazapiProvider(appCredentials, appValidation);
+  const openaiOk = appValidation['openai_api_key'] === true;
+  const allAppValid = whatsappOk && openaiOk;
+
+  // URL do webhook que o usuário precisa cadastrar na Uazapi (só aparece quando
+  // os campos da Uazapi estão preenchidos e válidos). O Supabase URL vem do
+  // step 2 (localStorage) ou das envs do build pós-redeploy.
+  const supabaseBase = (core.supabase_url || getSupabaseCredentials()?.url || '').replace(/\/$/, '');
+  const uazapiWebhookUrl = supabaseBase
+    ? `${supabaseBase}/functions/v1/whatsapp-inbound?provider=uazapi`
+    : '';
+
+  return (
+    <div className="min-h-screen bg-[#0A0A0F] px-4 py-8 text-[#F8FAFC] md:py-12">
+      <div className="mx-auto w-full max-w-[760px]">
+        <StepIndicator step={step} />
+        <SetupCard>
+          {step === 1 ? (
+            <>
+              <h1 className="mb-2 text-[28px] font-semibold text-[#F8FAFC]">{setupConfig.toolName}</h1>
+              <p className="mb-8 text-base leading-[1.6] text-[#94A3B8]">
+                Antes de iniciar, deixe abertas as contas onde voce vai copiar os tokens de bootstrap.
+              </p>
+              <div className="space-y-4">
+                <PrepItem n={1} title="Criar projeto Supabase" text="Crie um projeto vazio e copie URL, anon key e service role key." href="https://supabase.com/dashboard/new" pills={['SUPABASE_URL', 'ANON_KEY', 'SERVICE_ROLE']} />
+                <PrepItem n={2} title="Gerar PAT Supabase" text="Crie um Personal Access Token para rodar migrations e deployar Edge Functions." href="https://supabase.com/dashboard/account/tokens" pills={['SUPABASE_PAT']} />
+                <PrepItem n={3} title="Gerar Vercel Token" text="Crie um token para o wizard configurar envs core e disparar o redeploy." href="https://vercel.com/account/tokens" pills={['VERCEL_TOKEN']} />
+              </div>
+              <div className="mt-8 flex justify-end">
+                <PrimaryButton onClick={() => setStep(2)}>Ja tenho tudo isso, continuar</PrimaryButton>
+              </div>
+            </>
+          ) : null}
+
+          {step === 2 ? (
+            <>
+              <h1 className="mb-2 text-[28px] font-semibold text-[#F8FAFC]">Credenciais core</h1>
+              <p className="mb-8 text-base leading-[1.6] text-[#94A3B8]">
+                Estas credenciais sao usadas uma vez para preparar a instancia. Senha do owner nao fica salva.
+              </p>
+              <div className="grid gap-4">
+                {(Object.keys(emptyCore) as FieldKey[]).map((key) => {
+                  const isSecret = key.includes('key') || key.includes('token') || key.includes('password');
+                  const revealed = showCorePassword[key];
+                  return (
+                    <div key={key}>
+                      <label className="mb-1.5 block text-[13px] font-medium text-[#CBD5E1]">
+                        {key.toUpperCase()}
+                      </label>
+                      <div className="relative">
+                        <input
+                          type={isSecret && !revealed ? 'password' : 'text'}
+                          value={core[key]}
+                          onChange={(event) => {
+                            const next = event.target.value;
+                            setTouched((prev) => ({ ...prev, [key]: true }));
+                            setCore((prev) => ({ ...prev, [key]: next }));
+                          }}
+                          autoComplete={key === 'owner_password' ? 'new-password' : 'off'}
+                          className="w-full rounded-lg border border-[rgba(59,130,246,0.2)] bg-white/[0.03] px-4 py-3 pr-16 text-sm text-[#F8FAFC] placeholder:text-[#94A3B8] focus:border-[#3B82F6] focus:outline-none focus:shadow-[0_0_20px_rgba(59,130,246,0.2)]"
+                        />
+                        <div className="absolute right-3 top-1/2 flex -translate-y-1/2 items-center gap-2">
+                          {isSecret ? (
+                            <button
+                              type="button"
+                              aria-label={revealed ? 'Ocultar' : 'Mostrar'}
+                              onClick={() => setShowCorePassword((prev) => ({ ...prev, [key]: !prev[key] }))}
+                              className="text-[#94A3B8] hover:text-[#F8FAFC]"
+                            >
+                              {revealed ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                            </button>
+                          ) : null}
+                          {validation[key]?.ok ? <Check className="h-4 w-4 text-[#10B981]" /> : validation[key] ? <X className="h-4 w-4 text-[#EF4444]" /> : null}
+                        </div>
+                      </div>
+                      {validation[key]?.message ? (
+                        <p className={validation[key]?.ok ? 'mt-1 text-xs text-[#10B981]' : 'mt-1 text-xs text-[#EF4444]'}>
+                          {validation[key]?.message}
+                        </p>
+                      ) : null}
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="mt-8 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <button
+                  type="button"
+                  onClick={() => setStep(1)}
+                  className="min-h-11 w-full rounded-lg border border-[rgba(59,130,246,0.25)] bg-white/[0.03] px-5 text-sm font-medium text-[#F8FAFC] transition hover:border-[#3B82F6] sm:w-auto"
+                >
+                  Voltar
+                </button>
+                <PrimaryButton disabled={!coreReady || bootstrapping} onClick={runBootstrap}>
+                  Configurar
+                </PrimaryButton>
+              </div>
+            </>
+          ) : null}
+
+          {step === 3 ? (
+            <>
+              <h1 className="mb-2 text-[28px] font-semibold text-[#F8FAFC]">Bootstrap</h1>
+              <p className="mb-8 text-base leading-[1.6] text-[#94A3B8]">
+                Preparando Supabase, Edge Functions, owner e Vercel.
+              </p>
+              <div className="space-y-3">
+                {TIMELINE_STEPS.map((entry) => (
+                  <div key={entry.label} className="flex items-center gap-3 rounded-xl border border-[rgba(59,130,246,0.12)] bg-white/[0.02] p-4">
+                    {timeline.includes(entry.label) ? <Check className="h-5 w-5 text-[#10B981]" /> : <Loader2 className="h-5 w-5 animate-spin text-[#60A5FA]" />}
+                    <span className="text-sm text-[#F8FAFC]">{entry.label}</span>
+                  </div>
+                ))}
+              </div>
+              {waitingForApp ? (
+                <p className="mt-6 text-center text-sm text-[#94A3B8]">
+                  O Vercel esta publicando o novo deployment com as envs. Isso pode levar alguns minutos.
+                </p>
+              ) : null}
+
+              {deployTimedOut ? (
+                <div className="mt-8 rounded-xl border border-[rgba(239,68,68,0.3)] bg-[rgba(239,68,68,0.06)] p-5">
+                  <p className="text-sm leading-5 text-[#F8FAFC]">
+                    O redeploy esta demorando mais que o esperado. Verifique o status em{' '}
+                    <a
+                      href="https://vercel.com/dashboard"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-[#60A5FA] underline hover:text-[#85B7EB]"
+                    >
+                      vercel.com/dashboard
+                    </a>
+                    . Quando o app estiver no ar, continue.
+                  </p>
+                  <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:justify-end">
+                    <button
+                      type="button"
+                      onClick={() => void waitForAppLive()}
+                      className="min-h-11 rounded-lg border border-[rgba(59,130,246,0.25)] bg-white/[0.03] px-5 text-sm font-medium text-[#F8FAFC] transition hover:border-[#3B82F6]"
+                    >
+                      Verificar de novo
+                    </button>
+                    <PrimaryButton onClick={() => { window.location.href = '/setup?step=4&r=' + Date.now(); }}>
+                      Continuar mesmo assim
+                    </PrimaryButton>
+                  </div>
+                </div>
+              ) : !bootstrapping && !waitingForApp ? (
+                <div className="mt-8 space-y-3">
+                  {!core.owner_password ? (
+                    <div>
+                      <label className="mb-1.5 block text-[13px] font-medium text-[#CBD5E1]">
+                        Reinforme a senha do owner para retomar
+                      </label>
+                      <input
+                        type="password"
+                        value={core.owner_password}
+                        onChange={(event) => setCore((prev) => ({ ...prev, owner_password: event.target.value }))}
+                        placeholder="senha do owner"
+                        autoComplete="current-password"
+                        className="w-full rounded-lg border border-[rgba(59,130,246,0.2)] bg-white/[0.03] px-4 py-3 text-sm text-[#F8FAFC] placeholder:text-[#94A3B8] focus:border-[#3B82F6] focus:outline-none focus:shadow-[0_0_20px_rgba(59,130,246,0.2)]"
+                      />
+                    </div>
+                  ) : null}
+                  <div className="flex justify-end">
+                    <PrimaryButton disabled={!core.owner_password} onClick={runBootstrap}>Tentar de novo</PrimaryButton>
+                  </div>
+                </div>
+              ) : null}
+            </>
+          ) : null}
+
+          {step === 4 ? (
+            <>
+              <h1 className="mb-2 text-[28px] font-semibold text-[#F8FAFC]">APIs da aplicacao</h1>
+              <p className="mb-8 text-base leading-[1.6] text-[#94A3B8]">
+                Salve as chaves usadas pela ferramenta. Elas ficam criptografadas no seu Supabase.
+              </p>
+              {!ownerToken ? (
+                <div className="rounded-xl border border-[rgba(59,130,246,0.12)] bg-white/[0.02] p-5">
+                  <h2 className="text-base font-semibold text-[#F8FAFC]">Confirme o login do owner</h2>
+                  <p className="mt-1 text-[13px] leading-5 text-[#94A3B8]">
+                    Por seguranca, a senha do owner nao foi salva. Entre novamente para autorizar o salvamento das credenciais.
+                  </p>
+                  <div className="mt-4 grid gap-3">
+                    <input
+                      type="email"
+                      value={loginEmail}
+                      onChange={(event) => setLoginEmail(event.target.value)}
+                      placeholder="email do owner"
+                      autoComplete="username"
+                      className="w-full rounded-lg border border-[rgba(59,130,246,0.2)] bg-white/[0.03] px-4 py-3 text-sm text-[#F8FAFC] placeholder:text-[#94A3B8] focus:border-[#3B82F6] focus:outline-none focus:shadow-[0_0_20px_rgba(59,130,246,0.2)]"
+                    />
+                    <div className="relative">
+                      <input
+                        type={showLoginPassword ? 'text' : 'password'}
+                        value={loginPassword}
+                        onChange={(event) => setLoginPassword(event.target.value)}
+                        placeholder="senha do owner"
+                        autoComplete="current-password"
+                        className="w-full rounded-lg border border-[rgba(59,130,246,0.2)] bg-white/[0.03] px-4 py-3 pr-10 text-sm text-[#F8FAFC] placeholder:text-[#94A3B8] focus:border-[#3B82F6] focus:outline-none focus:shadow-[0_0_20px_rgba(59,130,246,0.2)]"
+                      />
+                      <button
+                        type="button"
+                        aria-label={showLoginPassword ? 'Ocultar' : 'Mostrar'}
+                        onClick={() => setShowLoginPassword((next) => !next)}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-[#94A3B8] hover:text-[#F8FAFC]"
+                      >
+                        {showLoginPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                      </button>
+                    </div>
+                  </div>
+                  <div className="mt-4 flex justify-end">
+                    <PrimaryButton
+                      disabled={!loginEmail.trim() || !loginPassword || loggingIn}
+                      onClick={loginOwner}
+                    >
+                      {loggingIn ? 'Entrando...' : 'Entrar'}
+                    </PrimaryButton>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <p className="mb-4 text-[13px] leading-5 text-[#94A3B8]">
+                    Configure <strong className="text-[#F8FAFC]">pelo menos um</strong> provedor de
+                    WhatsApp. Pode preencher os dois — o oficial (Zernio) e o não-oficial (Uazapi)
+                    coexistem.
+                  </p>
+                  <WhatsAppProviderCards
+                    zernioField={zernioField}
+                    uazapiUrlField={uazapiUrlField}
+                    uazapiTokenField={uazapiTokenField}
+                    onCredentialChange={onCredentialChange}
+                    onValidationChange={(key, ok) => setAppValidation((prev) => ({ ...prev, [key]: ok }))}
+                  />
+                  {/* OpenAI — necessária para embeddings/Whisper */}
+                  <div className="glass-card mt-4 p-5">
+                    <div className="mb-3 text-base font-semibold text-[#F8FAFC]">OpenAI (IA)</div>
+                    <CredentialField
+                      field={openaiField}
+                      initialHasValue={false}
+                      onChange={onCredentialChange}
+                      onValidationChange={(key, ok) => setAppValidation((prev) => ({ ...prev, [key]: ok }))}
+                    />
+                  </div>
+                  {!whatsappOk ? (
+                    <p className="mt-3 text-[13px] font-medium text-[#EF4444]">
+                      {NO_WHATSAPP_PROVIDER_MESSAGE}
+                    </p>
+                  ) : null}
+                  {uazapiOk && uazapiWebhookUrl ? (
+                    <div className="mt-4 rounded-xl border border-[rgba(245,158,11,0.3)] bg-[rgba(245,158,11,0.06)] p-5">
+                      <div className="text-sm font-semibold text-[#F8FAFC]">
+                        Cadastre este webhook na Uazapi
+                      </div>
+                      <p className="mt-1 text-[13px] leading-5 text-[#94A3B8]">
+                        Para as mensagens chegarem ao CRM, registre esta URL como webhook da sua
+                        instância Uazapi. Clique em <strong className="text-[#F8FAFC]">Cadastrar
+                        automaticamente</strong> ou registre manualmente no painel da instância →
+                        Webhook, evento “messages”.
+                      </p>
+                      <div className="mt-3 flex items-start gap-2">
+                        <code className="min-w-0 flex-1 break-all rounded-lg border border-[rgba(59,130,246,0.2)] bg-white/[0.03] px-3 py-2 text-xs text-[#F8FAFC]">
+                          {uazapiWebhookUrl}
+                        </code>
+                        <button
+                          type="button"
+                          aria-label="Copiar URL do webhook"
+                          onClick={() => {
+                            void navigator.clipboard
+                              .writeText(uazapiWebhookUrl)
+                              .then(() => toast.success('URL do webhook copiada.'))
+                              .catch(() => toast.error('Não foi possível copiar — copie manualmente.'));
+                          }}
+                          className="rounded-lg border border-[rgba(59,130,246,0.25)] bg-white/[0.03] px-3 py-2 text-sm font-medium text-[#F8FAFC] transition hover:border-[#3B82F6]"
+                        >
+                          Copiar
+                        </button>
+                      </div>
+                      <div className="mt-3 flex justify-end">
+                        <button
+                          type="button"
+                          disabled={!ownerToken || registeringHook}
+                          onClick={() => void registerUazapiWebhook()}
+                          className="rounded-lg bg-gradient-to-br from-[#1E3A8A] to-[#3B82F6] px-4 py-2 text-sm font-semibold text-white transition hover:opacity-90 disabled:opacity-50"
+                        >
+                          {registeringHook ? 'Registrando…' : 'Cadastrar automaticamente'}
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
+                  <p className="mt-3 text-[13px] text-[#94A3B8]">
+                    Provider de LLM e chave alternativa ficam em Configurações →
+                    Credenciais (Configurações Avançadas). Sem isso, a IA usa OpenAI por padrão.
+                  </p>
+                  {accountChoices ? (
+                    <div className="mt-6 rounded-xl border border-[rgba(59,130,246,0.12)] bg-white/[0.02] p-5">
+                      <h2 className="text-base font-semibold text-[#F8FAFC]">Escolha a conta WhatsApp</h2>
+                      <p className="mt-1 text-[13px] leading-5 text-[#94A3B8]">
+                        Sua Zernio API Key tem mais de uma conta. Selecione qual numero esta instancia vai operar.
+                      </p>
+                      <div className="mt-4 space-y-2">
+                        {accountChoices.map((acc) => (
+                          <label
+                            key={acc.id}
+                            className={[
+                              'flex cursor-pointer items-center gap-3 rounded-lg border p-3 transition',
+                              selectedAccount === acc.id
+                                ? 'border-[#3B82F6] bg-[rgba(59,130,246,0.08)]'
+                                : 'border-[rgba(59,130,246,0.2)] bg-white/[0.02] hover:border-[#3B82F6]',
+                            ].join(' ')}
+                          >
+                            <input
+                              type="radio"
+                              name="zernio-account"
+                              value={acc.id}
+                              checked={selectedAccount === acc.id}
+                              onChange={() => setSelectedAccount(acc.id)}
+                              className="accent-[#3B82F6]"
+                            />
+                            <span className="min-w-0 flex-1 truncate text-sm text-[#F8FAFC]">{acc.name}</span>
+                            <span className="shrink-0 font-mono text-[11px] text-[#94A3B8]">{acc.id}</span>
+                          </label>
+                        ))}
+                      </div>
+                      <div className="mt-4 flex justify-end">
+                        <PrimaryButton
+                          disabled={!selectedAccount || savingApps}
+                          onClick={() => saveAppCredentials(selectedAccount)}
+                        >
+                          {savingApps ? 'Conectando...' : 'Conectar conta'}
+                        </PrimaryButton>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="mt-8 flex justify-end">
+                      <PrimaryButton disabled={!allAppValid || savingApps} onClick={() => saveAppCredentials()}>
+                        {savingApps ? 'Conectando...' : 'Salvar e conectar'}
+                      </PrimaryButton>
+                    </div>
+                  )}
+                </>
+              )}
+            </>
+          ) : null}
+        </SetupCard>
+      </div>
+    </div>
+  );
+}

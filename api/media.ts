@@ -14,7 +14,13 @@ export default async function handler(req: any, res: any) {
     // Security: Only allow proxying URLs from trusted domains
     try {
       const parsedUrl = new URL(url);
-      if (!parsedUrl.hostname.endsWith('zernio.com')) {
+      const isAllowed = 
+        parsedUrl.hostname.endsWith('zernio.com') ||
+        parsedUrl.hostname.endsWith('amazonaws.com') ||
+        parsedUrl.hostname.endsWith('fbsbx.com') ||
+        parsedUrl.hostname.endsWith('whatsapp.net');
+
+      if (!isAllowed) {
         return res.status(403).json({ error: 'Domain not allowed for proxying' });
       }
     } catch {

@@ -1,75 +1,120 @@
 import { getCredential } from '../src/lib/credentials.js';
 
+// Domínios permitidos para a URL original e para redirecionamentos (Location)
+const ALLOWED_DOMAINS = [
+  'zernio.com',
+  'amazonaws.com',
+  'fbsbx.com',
+  'whatsapp.net',
+];
+
+// Tempo máximo de espera pela resposta (10 segundos)
+const FETCH_TIMEOUT_MS = 10000;
+
+// Função auxiliar para verificar se um hostname é permitido
+function isDomainAllowed(hostname: string): boolean {
+  return ALLOWED_DOMAINS.some((domain) => hostname.endsWith(domain));
+}
+
 export default async function handler(req: any, res: any) {
+  // 1. Verifica método HTTP
   if (req.method !== 'GET') {
-    return res.status(405).json({ error: 'Method Not Allowed' });
+    return res.status(405).json({ error: 'Método não permitido' });
   }
 
   try {
-    const url = req.query.url;
-    if (!url) {
-      return res.status(400).json({ error: 'Missing url parameter' });
+    // 2. Obtém e valida o parâmetro 'url'
+    const urlParam = req.query.url;
+    if (!urlParam || typeof urlParam !== 'string') {
+      return res.status(400).json({ error: 'Parâmetro "url" é obrigatório' });
     }
 
-    // Security: Only allow proxying URLs from trusted domains
+    let parsedUrl: URL;
     try {
-      const parsedUrl = new URL(url);
-      const isAllowed = 
-        parsedUrl.hostname.endsWith('zernio.com') ||
-        parsedUrl.hostname.endsWith('amazonaws.com') ||
-        parsedUrl.hostname.endsWith('fbsbx.com') ||
-        parsedUrl.hostname.endsWith('whatsapp.net');
-
-      if (!isAllowed) {
-        console.warn('PROXY_DOMAIN_BLOCKED_TEMPORARILY_BYPASSED', parsedUrl.hostname);
-        // return res.status(403).json({ error: 'Domain not allowed for proxying' });
-      }
+      parsedUrl = new URL(urlParam);
     } catch {
-      return res.status(400).json({ error: 'Invalid URL format' });
+      return res.status(400).json({ error: 'URL inválida' });
     }
 
+    // 3. Restringe protocolo (apenas HTTP/HTTPS)
+    if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+      return res.status(400).json({ error: 'Apenas URLs HTTP/HTTPS são permitidas' });
+    }
+
+    // 4. Verifica se o domínio da URL original está na lista de permitidos
+    if (!isDomainAllowed(parsedUrl.hostname)) {
+      console.warn(`Domínio bloqueado: ${parsedUrl.hostname}`);
+      return res.status(403).json({ error: 'Domínio não autorizado para proxy' });
+    }
+
+    // 5. Obtém a chave de API
     const apiKey = await getCredential('zernio_api_key');
     if (!apiKey) {
-      return res.status(500).json({ error: 'Zernio API Key missing' });
+      console.error('Chave de API Zernio não encontrada');
+      return res.status(500).json({ error: 'Erro interno de configuração' });
     }
 
-    // Use redirect: 'manual' to catch the 302 redirect to S3.
-    // If we let fetch follow the redirect, it will send the Authorization header
-    // to S3, which will reject it with a 400 Bad Request.
-    const response = await fetch(url, {
+    // 6. Configura timeout para o fetch
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+    // 7. Faz a requisição com redirect manual
+    const response = await fetch(urlParam, {
       headers: {
         Authorization: `Bearer ${apiKey}`,
       },
       redirect: 'manual',
+      signal: controller.signal,
     });
 
-    // If it's a redirect, send the redirect back to the browser!
-    // The browser will fetch the S3 URL directly, bypassing our serverless function bandwidth.
+    clearTimeout(timeoutId);
+
+    // 8. Lida com redirecionamentos (3xx)
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get('location');
       if (location) {
-        return res.redirect(response.status, location);
+        // Resolve o Location (pode ser relativo)
+        const redirectUrl = new URL(location, urlParam);
+        // Verifica se o domínio do redirecionamento é permitido
+        if (isDomainAllowed(redirectUrl.hostname)) {
+          // Redireciona o cliente para a URL do S3 (economiza banda)
+          return res.redirect(response.status, redirectUrl.href);
+        } else {
+          // Se o destino não for permitido, retorna erro (segurança)
+          console.warn(`Redirecionamento para domínio não permitido: ${redirectUrl.hostname}`);
+          return res.status(403).json({ error: 'Redirecionamento para domínio não autorizado' });
+        }
+      } else {
+        // Redirecionamento sem Location
+        return res.status(500).json({ error: 'Redirecionamento sem destino' });
       }
     }
 
+    // 9. Para respostas não-redirecionamento, verifica se houve erro HTTP
     if (!response.ok) {
-      return res.status(response.status).json({ error: 'Failed to fetch media' });
+      // Log do status e eventualmente do corpo (com cuidado)
+      console.error(`Erro ao buscar mídia: ${response.status} ${response.statusText}`);
+      return res.status(response.status).json({ error: 'Falha ao buscar a mídia' });
     }
 
+    // 10. Define cabeçalhos de resposta
     const contentType = response.headers.get('content-type');
     if (contentType) {
       res.setHeader('Content-Type', contentType);
     }
-    
-    // Set caching headers
+    // Cache de longo prazo (1 ano)
     res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
 
+    // 11. Transmite o corpo da resposta em buffer
     const arrayBuffer = await response.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-    
-    return res.status(200).send(buffer);
+    return res.status(200).send(Buffer.from(arrayBuffer));
   } catch (error: any) {
-    console.error('Media proxy error:', error);
-    return res.status(500).json({ error: error.message });
+    // 12. Tratamento de erros genérico (não expõe detalhes)
+    console.error('Erro no proxy de mídia:', error.message);
+    // Se for erro de abort (timeout), retorna mensagem específica
+    if (error.name === 'AbortError') {
+      return res.status(504).json({ error: 'Tempo limite excedido' });
+    }
+    return res.status(500).json({ error: 'Erro interno ao processar a requisição' });
   }
 }

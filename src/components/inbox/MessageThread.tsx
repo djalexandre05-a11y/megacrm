@@ -54,22 +54,24 @@ function MediaContent({ message }: { message: Message }) {
   const caption = message.content?.trim();
 
   if (isHttp) {
+    const proxyUrl = url.includes('zernio.com') || url.includes('fbsbx.com') ? `/api/media?url=${encodeURIComponent(url)}` : url;
+    
     if (message.content_type === 'image') {
       return (
         <div className="space-y-1">
-          <img src={url} alt={caption || label} className="max-h-64 rounded-lg" loading="lazy" />
+          <img src={proxyUrl} alt={caption || label} className="max-h-64 rounded-lg" loading="lazy" />
           {caption && <div className="whitespace-pre-wrap break-words">{caption}</div>}
         </div>
       );
     }
     if (message.content_type === 'audio') {
-      return <audio controls src={url} className="max-w-full" />;
+      return <audio controls src={proxyUrl} className="max-w-full" />;
     }
     if (message.content_type === 'video') {
-      return <video controls src={url} className="max-h-64 rounded-lg" />;
+      return <video controls src={proxyUrl} className="max-h-64 rounded-lg" />;
     }
     return (
-      <a href={url} target="_blank" rel="noopener noreferrer" className="underline break-all">
+      <a href={proxyUrl} target="_blank" rel="noopener noreferrer" className="underline break-all">
         {caption || `Abrir ${label.toLowerCase()}`}
       </a>
     );

@@ -44,10 +44,22 @@ export function MessageInput({ conversationId, disabled, withinWindow = true, on
     form.append('conversation_id', conversationId);
     form.append('file', file);
     if (content.trim()) form.append('content', content.trim());
-    const { data, error } = await supabase.functions.invoke('send-operator-media', { body: form });
-    if (error || !data?.ok) {
+    const { data: { session } } = await supabase.auth.getSession();
+    const functionUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/send-operator-media`;
+    
+    const res = await fetch(functionUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${session?.access_token ?? ''}`,
+      },
+      body: form,
+    });
+    
+    const data = await res.json().catch(() => null);
+    
+    if (!res.ok || !data?.ok) {
       toast.error('Falha ao enviar mídia', {
-        description: data?.error ?? error?.message ?? 'Erro desconhecido',
+        description: data?.error ?? 'Erro desconhecido ao enviar o arquivo',
       });
       return;
     }

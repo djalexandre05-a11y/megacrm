@@ -68,7 +68,7 @@ export async function loadZernioContext(): Promise<ZernioContext> {
   return { apiKey, accountId, profileId: creds.zernio_profile_id?.trim() || null };
 }
 
-async function zfetch(
+export async function zfetch(
   apiKey: string,
   path: string,
   init: RequestInit = {},

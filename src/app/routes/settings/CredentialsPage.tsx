@@ -260,6 +260,17 @@ export default function CredentialsPage() {
               )}
               {zernio.webhook_url ? (
                 <div className="mt-3 space-y-2">
+                  <button
+                    onClick={() => {
+                        fetch('/api/zernio-connect/sync-history', {
+                            method: 'POST',
+                            headers: { Authorization: `Bearer ${session?.access_token ?? ''}` }
+                        }).then(() => toast.success('Sincronização iniciada!'));
+                    }}
+                    className="mb-2 text-[10px] uppercase tracking-wide text-[var(--accent-primary)] underline"
+                  >
+                    Sincronizar Histórico Antigo
+                  </button>
                   <div className="text-[11px] uppercase tracking-wide text-[var(--color-text-secondary)]">
                     Webhook para receber mensagens (cadastre no Zernio)
                   </div>

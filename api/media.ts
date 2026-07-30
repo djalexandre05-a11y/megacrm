@@ -11,16 +11,39 @@ export default async function handler(req: any, res: any) {
       return res.status(400).json({ error: 'Missing url parameter' });
     }
 
+    // Security: Only allow proxying URLs from trusted domains
+    try {
+      const parsedUrl = new URL(url);
+      if (!parsedUrl.hostname.endsWith('zernio.com')) {
+        return res.status(403).json({ error: 'Domain not allowed for proxying' });
+      }
+    } catch {
+      return res.status(400).json({ error: 'Invalid URL format' });
+    }
+
     const apiKey = await getCredential('zernio_api_key');
     if (!apiKey) {
       return res.status(500).json({ error: 'Zernio API Key missing' });
     }
 
+    // Use redirect: 'manual' to catch the 302 redirect to S3.
+    // If we let fetch follow the redirect, it will send the Authorization header
+    // to S3, which will reject it with a 400 Bad Request.
     const response = await fetch(url, {
       headers: {
         Authorization: `Bearer ${apiKey}`,
       },
+      redirect: 'manual',
     });
+
+    // If it's a redirect, send the redirect back to the browser!
+    // The browser will fetch the S3 URL directly, bypassing our serverless function bandwidth.
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get('location');
+      if (location) {
+        return res.redirect(response.status, location);
+      }
+    }
 
     if (!response.ok) {
       return res.status(response.status).json({ error: 'Failed to fetch media' });

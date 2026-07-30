@@ -54,7 +54,9 @@ function MediaContent({ message }: { message: Message }) {
   const caption = message.content?.trim();
 
   if (isHttp) {
-    const proxyUrl = url.includes('zernio.com') || url.includes('fbsbx.com') ? `/api/media?url=${encodeURIComponent(url)}` : url;
+    // Toda mídia passa pelo proxy /api/media — as URLs do Zernio/Meta precisam
+    // de Bearer token para download e o browser não consegue acessá-las direto.
+    const proxyUrl = `/api/media?url=${encodeURIComponent(url)}`;
     
     if (message.content_type === 'image') {
       return (
